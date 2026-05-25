@@ -1,10 +1,10 @@
 @echo off
-title Object Detection & Tracking System - Enterprise Vision
+title Object Detection and Tracking System - Enterprise Vision
 color 0A
 cls
 
 echo =========================================================================
-echo  OBJECT DETECTION & TRACKING SYSTEM
+echo  OBJECT DETECTION AND TRACKING SYSTEM
 echo  Enterprise Vision System v1.0 // Antigravity Core
 echo =========================================================================
 echo.
@@ -13,7 +13,7 @@ echo.
 python --version >nul 2>&1
 if %errorlevel% neq 0 (
     echo [ERROR] Python is not installed or not in system PATH.
-    echo Please install Python 3.8+ (64-bit recommended) from python.org.
+    echo Please install Python 3.8 or higher from python.org.
     echo.
     pause
     exit /b 1
@@ -49,7 +49,6 @@ pip install -r requirements.txt
 if %errorlevel% neq 0 (
     echo.
     echo [ERROR] Dependency installation encountered problems.
-    echo Please check internet connection and pip configuration.
     echo.
     pause
     exit /b 1
