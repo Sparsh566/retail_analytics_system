@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 import time
 import random
-import config
+from src import config
 
 try:
     from ultralytics import YOLO

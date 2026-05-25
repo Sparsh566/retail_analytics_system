@@ -7,7 +7,7 @@ from tkinter import messagebox
 from PIL import Image, ImageTk
 import time
 import cv2
-import config
+from src import config
 
 class DashboardApp:
     """

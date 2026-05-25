@@ -45,7 +45,7 @@ class DeepSortTracker:
 
         if self.is_emulated:
             # Re-use our custom SORT logic as a fallback to prevent app crashing
-            from sort_tracker import SortTracker
+            from src.trackers.sort import SortTracker
             self.emulated_tracker = SortTracker(max_age=max_age, min_hits=n_init, iou_threshold=0.2)
 
     def update(self, detections, frame):
