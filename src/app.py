@@ -1,318 +1,959 @@
-# main.py
-# Main entry point and orchestration controller for the retail analytics tracking system.
-# Coordinates frames, trackers, diagnostics, retail analytics, and drawing loops.
+# src/app.py
+# Web-native orchestration controller using Flask.
+# Serves real-time side-by-side SORT vs DeepSORT streaming feeds on http://localhost:5000.
 
-import tkinter as tk
-from PIL import Image, ImageTk
-import cv2
-import time
+import os
 import sys
+import time
+import signal
+import threading
+import cv2
+import numpy as np
+from flask import Flask, Response, jsonify, request
+
 from src import config
 from src.vision.detector import Detector
 from src.trackers.sort import SortTracker
 from src.trackers.deepsort import DeepSortTracker
-from src.ui.dashboard import DashboardApp
 
 class MainController:
     """
-    Orchestrates frame grabbing, tracking logic, stats calculation, drawing, and UI updates.
+    Background vision loop processor and Flask web server host.
     """
     def __init__(self):
-        # 1. Boot Tkinter Frame
-        self.root = tk.Tk()
-        self.dashboard = DashboardApp(self.root, self)
+        self.app = Flask(__name__)
         
-        # 2. State metrics and trackers
+        # State variables
+        self.is_paused = False
+        self.loop_active = False
+        self.processing_thread = None
+        self.lock = threading.Lock()
+        
+        # Subsystems
         self.detector = None
         self.sort_tracker = None
         self.deepsort_tracker = None
         
-        # Retail Analytics State variables
+        # JPEG streaming frame buffers
+        self.latest_sort_frame = None
+        self.latest_ds_frame = None
+        
+        # Analytical Registers
         self.sort_unique_people = set()
         self.ds_unique_people = set()
-        
-        # Dictionary storing {track_id: {"first_seen": timestamp, "last_seen": timestamp}}
         self.dwell_times_sort = {}
         self.dwell_times_ds = {}
-        
-        # Set of active person IDs from previous frame to detect enter/exit transitions
         self.prev_sort_persons = set()
         self.prev_ds_persons = set()
         
-        # Thread/Timer schedule handle
-        self.after_id = None
+        # Session Event Logs
+        self.event_logs = []
         
-        # Window closing hook
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-
-    def run(self):
-        """
-        Starts the desktop window main event loop.
-        """
-        self.root.mainloop()
+        # Global stats dictionary
+        self.stats = {
+            "sort_active": 0, "sort_lost": 0,
+            "ds_active": 0, "ds_lost": 0,
+            "fps_sort": 0.0, "fps_ds": 0.0,
+            "dets_count": 0,
+            "switches_sort": 0, "switches_ds": 0,
+            "footfall": 0,
+            "dwell_list": "",
+            "tracked_objects": [],
+            "status_text": "PAUSED - CLICK START TO INITIALIZE",
+            "simulation_mode": False
+        }
+        
+        # Bind flask endpoints
+        self._setup_routes()
 
     # -------------------------------------------------------------------------
-    # PIPELINE LIFECYCLE MANAGEMENT
+    # ROUTE DEFINITIONS
+    # -------------------------------------------------------------------------
+    def _setup_routes(self):
+        @self.app.route("/")
+        def index():
+            return Response(self._get_html_page(), mimetype="text/html")
+            
+        @self.app.route("/video_feed/sort")
+        def video_feed_sort():
+            return Response(self._stream_frame("sort"), mimetype="multipart/x-mixed-replace; boundary=frame")
+            
+        @self.app.route("/video_feed/deepsort")
+        def video_feed_deepsort():
+            return Response(self._stream_frame("deepsort"), mimetype="multipart/x-mixed-replace; boundary=frame")
+            
+        @self.app.route("/api/start")
+        def api_start():
+            if not self.loop_active:
+                self.start_tracking()
+            return jsonify({"status": "started"})
+            
+        @self.app.route("/api/stats")
+        def api_stats():
+            with self.lock:
+                return jsonify({
+                    "stats": self.stats,
+                    "logs": self.event_logs[-15:]  # Return last 15 log lines
+                })
+                
+        @self.app.route("/api/pause", methods=["POST"])
+        def api_pause():
+            self.is_paused = not self.is_paused
+            with self.lock:
+                if self.is_paused:
+                    self.stats["status_text"] = "PAUSED - SENSOR GRABBING DEACTIVATED"
+                    self._add_log("SYSTEM WARNING: Live pipeline paused by operator.")
+                else:
+                    self.stats["status_text"] = "RUNNING - BOTH TRACKERS ACTIVE"
+                    self._add_log("SYSTEM INFO: Live pipeline tracking resumed.")
+            return jsonify({"paused": self.is_paused})
+            
+        @self.app.route("/api/reset", methods=["POST"])
+        def api_reset():
+            self.reset_system_stats()
+            self._add_log("SYSTEM ACTION: Analytical records and trackers reset completed.")
+            return jsonify({"status": "reset"})
+            
+        @self.app.route("/api/quit", methods=["POST"])
+        def api_quit():
+            self._add_log("SYSTEM WARNING: Server termination requested. Shuting down...")
+            self.stop_tracking()
+            # Terminate flask
+            os.kill(os.getpid(), signal.SIGINT)
+            return jsonify({"status": "quitting"})
+
+    # -------------------------------------------------------------------------
+    # CORE TRACKER PIPELINE EXECUTION
     # -------------------------------------------------------------------------
     def start_tracking(self):
         """
-        Initializes core detector and trackers, clears logs, and starts the processing loop.
+        Loads models, initializes cameras, and runs processing thread.
         """
-        self.dashboard.write_event_log("SYSTEM ACTION: Activating sensors and loading models...")
-        
-        # Initialize detector (loads YOLOv8 or fallback simulator)
+        # Init components
         self.detector = Detector()
-        
-        # Initialize trackers
         self.sort_tracker = SortTracker(max_age=15, min_hits=3, iou_threshold=0.25)
         self.deepsort_tracker = DeepSortTracker(max_age=15, n_init=3)
         
-        # Reset metric registers
         self.reset_system_stats()
+        self._add_log("SYSTEM ACTION: Activating sensors and loading models...")
         
-        # Set mode status label
-        mode_text = "SIMULATION ENGINE ACTIVE" if self.detector.simulation_mode else "LIVE CAMERA ACTIVE"
-        self.dashboard.status_lbl.config(
-            text=f"RUNNING - BOTH TRACKERS ACTIVE ({mode_text})", 
-            fg=config.COLOR_CYAN if self.detector.simulation_mode else config.COLOR_GREEN
-        )
-        self.dashboard.write_event_log(f"SYSTEM INFO: Tracking pipeline running under {mode_text}.")
-
-        # Trigger processing loop
-        self.update_loop()
+        # Start background loop
+        self.loop_active = True
+        self.processing_thread = threading.Thread(target=self._processing_loop, daemon=True)
+        self.processing_thread.start()
 
     def stop_tracking(self):
         """
-        Cancels pending scheduled frames and releases system handles cleanly.
+        Stops loops and releases camera bindings.
         """
-        if self.after_id:
-            self.root.after_cancel(self.after_id)
-            self.after_id = None
+        self.loop_active = False
+        if self.processing_thread:
+            self.processing_thread.join(timeout=1.0)
+            self.processing_thread = None
             
         if self.detector:
             self.detector.close()
             self.detector = None
-            
-        self.dashboard.write_event_log("SYSTEM WARNING: Sensors and tracking pipelines deactivated.")
 
     def reset_system_stats(self):
         """
-        Resets all tracking, retail database registers, dwell times, and logs.
+        Wipes registers, logs, and trackers.
         """
-        self.sort_unique_people.clear()
-        self.ds_unique_people.clear()
-        self.dwell_times_sort.clear()
-        self.dwell_times_ds.clear()
-        self.prev_sort_persons.clear()
-        self.prev_ds_persons.clear()
-        
-        if self.sort_tracker:
-            self.sort_tracker.id_switches = 0
-            self.sort_tracker.trackers.clear()
-            self.sort_tracker.dead_track_history.clear()
+        with self.lock:
+            self.sort_unique_people.clear()
+            self.ds_unique_people.clear()
+            self.dwell_times_sort.clear()
+            self.dwell_times_ds.clear()
+            self.prev_sort_persons.clear()
+            self.prev_ds_persons.clear()
+            self.event_logs.clear()
             
-        if self.deepsort_tracker:
-            self.deepsort_tracker.id_switches = 0
-            self.deepsort_tracker.dead_track_history.clear()
-            if not self.deepsort_tracker.is_emulated:
-                self.deepsort_tracker.tracker.tracks.clear()
-            else:
-                self.deepsort_tracker.emulated_tracker.id_switches = 0
-                self.deepsort_tracker.emulated_tracker.trackers.clear()
-                self.deepsort_tracker.emulated_tracker.dead_track_history.clear()
-
-    # -------------------------------------------------------------------------
-    # MAIN REAL-TIME LOOP
-    # -------------------------------------------------------------------------
-    def update_loop(self):
-        """
-        Main tick processing: grabs frames, runs models, computes metrics, draws, and posts to canvas.
-        """
-        # If UI is paused, wait and tick slowly
-        if self.dashboard.is_paused:
-            self.after_id = self.root.after(100, self.update_loop)
-            return
-
-        # 1. Grab camera frame
-        start_grab = time.time()
-        frame, detections, is_simulated = self.detector.get_frame()
-        
-        # 2. Copy frames for separate rendering
-        frame_sort = frame.copy()
-        frame_ds = frame.copy()
-
-        # 3. Benchmark SORT Inference
-        t0 = time.perf_counter()
-        sort_tracks = self.sort_tracker.update(detections)
-        t_sort = time.perf_counter() - t0
-        fps_sort = 1.0 / max(1e-5, t_sort)
-
-        # 4. Benchmark DeepSORT Inference
-        t0 = time.perf_counter()
-        ds_tracks = self.deepsort_tracker.update(detections, frame)
-        t_ds = time.perf_counter() - t0
-        fps_ds = 1.0 / max(1e-5, t_ds)
-
-        # 5. Process Retail Analytics (Entered/Exited, Footfall, Dwell Times)
-        current_time = time.time()
-        active_sort_persons = set()
-        active_ds_persons = set()
-
-        # Update SORT Dwell metrics
-        for trk in sort_tracks:
-            x1, y1, x2, y2, trk_id, class_name, conf = trk
-            if class_name == config.RETAIL_CLASS_FILTER:
-                active_sort_persons.add(trk_id)
-                self.sort_unique_people.add(trk_id)
-                if trk_id not in self.dwell_times_sort:
-                    self.dwell_times_sort[trk_id] = {"first_seen": current_time, "last_seen": current_time}
-                    self.dashboard.write_event_log(f"ENTERED: SORT ID {trk_id} (person)")
+            if self.sort_tracker:
+                self.sort_tracker.id_switches = 0
+                self.sort_tracker.trackers.clear()
+                self.sort_tracker.dead_track_history.clear()
+                
+            if self.deepsort_tracker:
+                self.deepsort_tracker.id_switches = 0
+                self.deepsort_tracker.dead_track_history.clear()
+                if not self.deepsort_tracker.is_emulated:
+                    self.deepsort_tracker.tracker.tracks.clear()
                 else:
-                    self.dwell_times_sort[trk_id]["last_seen"] = current_time
+                    self.deepsort_tracker.emulated_tracker.id_switches = 0
+                    self.deepsort_tracker.emulated_tracker.trackers.clear()
+                    self.deepsort_tracker.emulated_tracker.dead_track_history.clear()
 
-        # Update DeepSORT Dwell metrics (used as primary dashboard display)
-        for trk in ds_tracks:
-            x1, y1, x2, y2, trk_id, class_name, conf = trk
-            if class_name == config.RETAIL_CLASS_FILTER:
-                active_ds_persons.add(trk_id)
-                self.ds_unique_people.add(trk_id)
-                if trk_id not in self.dwell_times_ds:
-                    self.dwell_times_ds[trk_id] = {"first_seen": current_time, "last_seen": current_time}
-                    self.dashboard.write_event_log(f"ENTERED: Customer DS_{trk_id} (person)")
-                else:
-                    self.dwell_times_ds[trk_id]["last_seen"] = current_time
-
-        # Detect SORT exits
-        for prev_id in self.prev_sort_persons:
-            if prev_id not in active_sort_persons:
-                dwell_sec = current_time - self.dwell_times_sort[prev_id]["first_seen"]
-                self.dashboard.write_event_log(f"EXITED:  SORT ID {prev_id} (person) - Dwell: {dwell_sec:.1f}s")
-        
-        # Detect DeepSORT exits
-        for prev_id in self.prev_ds_persons:
-            if prev_id not in active_ds_persons:
-                dwell_sec = current_time - self.dwell_times_ds[prev_id]["first_seen"]
-                self.dashboard.write_event_log(f"EXITED:  Customer DS_{prev_id} (person) - Dwell: {dwell_sec:.1f}s")
-
-        self.prev_sort_persons = active_sort_persons
-        self.prev_ds_persons = active_ds_persons
-
-        # 6. Drawing Bounding Boxes & Badges onto OpenCV frame copies
-        self._draw_overlay(frame_sort, sort_tracks, theme_color=(0, 255, 136)) # Green BGR for SORT
-        self._draw_overlay(frame_ds, ds_tracks, theme_color=(255, 207, 0))    # Cyan BGR for DeepSORT
-
-        # 7. Convert OpenCV frames to ImageTk standard canvas format (384x216)
-        sort_resized = cv2.resize(frame_sort, (384, 216))
-        ds_resized = cv2.resize(frame_ds, (384, 216))
-        
-        sort_rgb = cv2.cvtColor(sort_resized, cv2.COLOR_BGR2RGB)
-        ds_rgb = cv2.cvtColor(ds_resized, cv2.COLOR_BGR2RGB)
-        
-        sort_img_pil = Image.fromarray(sort_rgb)
-        ds_img_pil = Image.fromarray(ds_rgb)
-        
-        sort_img_tk = ImageTk.PhotoImage(image=sort_img_pil)
-        ds_img_tk = ImageTk.PhotoImage(image=ds_img_pil)
-        
-        self.dashboard.render_canvas_frames(sort_img_tk, ds_img_tk)
-
-        # 8. Push metrics and diagnostics updates to UI Panels
-        self.dashboard.sort_active_lbl.config(text=f"ACTIVE TRACKS: {self.sort_tracker.active_count} units")
-        self.dashboard.sort_lost_lbl.config(text=f"LOST TRACKS:   {self.sort_tracker.lost_count} units")
-        
-        self.dashboard.ds_active_lbl.config(text=f"ACTIVE TRACKS: {self.deepsort_tracker.active_count} units")
-        self.dashboard.ds_lost_lbl.config(text=f"LOST TRACKS:   {self.deepsort_tracker.lost_count} units")
-        
-        self.dashboard.fps_sort_lbl.config(text=f"SORT SPEED:     {fps_sort:5.1f} FPS (Inf: {t_sort*1000.0:.1f}ms)")
-        self.dashboard.fps_ds_lbl.config(text=f"DeepSORT SPEED: {fps_ds:5.1f} FPS (Inf: {t_ds*1000.0:.1f}ms)")
-        self.dashboard.dets_lbl.config(text=f"YOLOv8 DETECTED: {len(detections)} objects")
-        
-        self.dashboard.switches_sort_lbl.config(text=f"SORT ID SWITCHES:     {self.sort_tracker.id_switches} instances")
-        self.dashboard.switches_ds_lbl.config(text=f"DeepSORT ID SWITCHES: {self.deepsort_tracker.id_switches} instances")
-        
-        # Retail summary (Uses DeepSORT counts)
-        self.dashboard.footfall_lbl.config(text=f"TOTAL UNIQUE CUSTOMERS: {len(self.ds_unique_people)} persons")
-        
-        # Render Top 3 currently visible customer dwell times
-        dwells_desc = ""
-        top_visible = sorted(
-            [(pid, current_time - self.dwell_times_ds[pid]["first_seen"]) for pid in active_ds_persons if pid in self.dwell_times_ds],
-            key=lambda x: x[1], reverse=True
-        )[:3]
-        
-        if top_visible:
-            for pid, d_time in top_visible:
-                dwells_desc += f"- ID DS_{pid} (person): {d_time:5.1f}s\n"
-        else:
-            dwells_desc = "No shoppers currently visible in-frame.\n"
-        self.dashboard.dwell_list_lbl.config(text=dwells_desc.strip())
-
-        # 9. Update Database Table Panel (Show last 10 active tracks)
-        tracked_db_list = []
-        for trk in sort_tracks:
-            _, _, _, _, trk_id, class_name, conf = trk
-            tracked_db_list.append((f"SORT_{trk_id}", class_name, conf, "SORT"))
-        for trk in ds_tracks:
-            _, _, _, _, trk_id, class_name, conf = trk
-            tracked_db_list.append((f"DS_{trk_id}", class_name, conf, "DeepSORT"))
+    def _processing_loop(self):
+        """
+        Continually captures frames, tracks targets, updates BGR overlays, and compresses JPEGs.
+        """
+        while self.loop_active:
+            if self.is_paused:
+                time.sleep(0.05)
+                continue
+                
+            # 1. Grab camera frame
+            frame, detections, is_simulated = self.detector.get_frame()
             
-        self.dashboard.update_table(tracked_db_list[:10])
+            # 2. Copy frames for separate rendering
+            frame_sort = frame.copy()
+            frame_ds = frame.copy()
+            
+            # 3. Benchmark SORT Inference
+            t0 = time.perf_counter()
+            sort_tracks = self.sort_tracker.update(detections)
+            t_sort = time.perf_counter() - t0
+            fps_sort = 1.0 / max(1e-5, t_sort)
 
-        # Schedule next tick (around 30 FPS target)
-        self.after_id = self.root.after(20, self.update_loop)
+            # 4. Benchmark DeepSORT Inference
+            t0 = time.perf_counter()
+            ds_tracks = self.deepsort_tracker.update(detections, frame)
+            t_ds = time.perf_counter() - t0
+            fps_ds = 1.0 / max(1e-5, t_ds)
 
-    # -------------------------------------------------------------------------
-    # DRAW OVERLAY UTILITIES (OPENCV)
-    # -------------------------------------------------------------------------
+            # 5. Process Retail Analytics (Entered/Exited, Footfall, Dwell Times)
+            current_time = time.time()
+            active_sort_persons = set()
+            active_ds_persons = set()
+
+            # Update SORT Dwells
+            for trk in sort_tracks:
+                x1, y1, x2, y2, trk_id, class_name, conf = trk
+                if class_name == config.RETAIL_CLASS_FILTER:
+                    active_sort_persons.add(trk_id)
+                    self.sort_unique_people.add(trk_id)
+                    if trk_id not in self.dwell_times_sort:
+                        self.dwell_times_sort[trk_id] = {"first_seen": current_time, "last_seen": current_time}
+                        self._add_log(f"ENTERED: SORT ID {trk_id} (person)")
+                    else:
+                        self.dwell_times_sort[trk_id]["last_seen"] = current_time
+
+            # Update DeepSORT Dwells (primary UI)
+            for trk in ds_tracks:
+                x1, y1, x2, y2, trk_id, class_name, conf = trk
+                if class_name == config.RETAIL_CLASS_FILTER:
+                    active_ds_persons.add(trk_id)
+                    self.ds_unique_people.add(trk_id)
+                    if trk_id not in self.dwell_times_ds:
+                        self.dwell_times_ds[trk_id] = {"first_seen": current_time, "last_seen": current_time}
+                        self._add_log(f"ENTERED: Customer DS_{trk_id} (person)")
+                    else:
+                        self.dwell_times_ds[trk_id]["last_seen"] = current_time
+
+            # Detect exits
+            for prev_id in self.prev_sort_persons:
+                if prev_id not in active_sort_persons:
+                    dwell_sec = current_time - self.dwell_times_sort[prev_id]["first_seen"]
+                    self._add_log(f"EXITED:  SORT ID {prev_id} (person) - Dwell: {dwell_sec:.1f}s")
+            
+            for prev_id in self.prev_ds_persons:
+                if prev_id not in active_ds_persons:
+                    dwell_sec = current_time - self.dwell_times_ds[prev_id]["first_seen"]
+                    self._add_log(f"EXITED:  Customer DS_{prev_id} (person) - Dwell: {dwell_sec:.1f}s")
+
+            self.prev_sort_persons = active_sort_persons
+            self.prev_ds_persons = active_ds_persons
+
+            # 6. Render overlays
+            self._draw_overlay(frame_sort, sort_tracks, theme_color=(0, 255, 136)) # Green BGR for SORT
+            self._draw_overlay(frame_ds, ds_tracks, theme_color=(255, 207, 0))    # Cyan BGR for DeepSORT
+            
+            # Resize for visual dashboard layout (384x216)
+            sort_resized = cv2.resize(frame_sort, (384, 216))
+            ds_resized = cv2.resize(frame_ds, (384, 216))
+            
+            # Compress to JPEG
+            _, sort_jpg = cv2.imencode('.jpg', sort_resized)
+            _, ds_jpg = cv2.imencode('.jpg', ds_resized)
+            
+            # Update buffers and stats thread-safely
+            with self.lock:
+                self.latest_sort_frame = sort_jpg.tobytes()
+                self.latest_ds_frame = ds_jpg.tobytes()
+                
+                # Update status
+                mode_text = "SIMULATION ACTIVE" if is_simulated else "LIVE WEBCAM ACTIVE"
+                self.stats["status_text"] = f"RUNNING - BOTH TRACKERS ACTIVE ({mode_text})"
+                self.stats["simulation_mode"] = is_simulated
+                
+                self.stats["sort_active"] = self.sort_tracker.active_count
+                self.stats["sort_lost"] = self.sort_tracker.lost_count
+                self.stats["ds_active"] = self.deepsort_tracker.active_count
+                self.stats["ds_lost"] = self.deepsort_tracker.lost_count
+                
+                self.stats["fps_sort"] = round(fps_sort, 1)
+                self.stats["fps_ds"] = round(fps_ds, 1)
+                self.stats["dets_count"] = len(detections)
+                
+                self.stats["switches_sort"] = self.sort_tracker.id_switches
+                self.stats["switches_ds"] = self.deepsort_tracker.id_switches
+                
+                self.stats["footfall"] = len(self.ds_unique_people)
+                
+                # Render top 3 dwell times
+                dwells_desc = ""
+                top_visible = sorted(
+                    [(pid, current_time - self.dwell_times_ds[pid]["first_seen"]) for pid in active_ds_persons if pid in self.dwell_times_ds],
+                    key=lambda x: x[1], reverse=True
+                )[:3]
+                if top_visible:
+                    for pid, d_time in top_visible:
+                        dwells_desc += f"- ID DS_{pid} (person): {d_time:.1f}s<br>"
+                else:
+                    dwells_desc = "No shoppers currently visible in-frame."
+                self.stats["dwell_list"] = dwells_desc
+                
+                # Build database table list
+                tracked_db_list = []
+                for trk in sort_tracks:
+                    _, _, _, _, trk_id, class_name, conf = trk
+                    tracked_db_list.append([f"SORT_{trk_id}", class_name, round(conf, 3), "SORT"])
+                for trk in ds_tracks:
+                    _, _, _, _, trk_id, class_name, conf = trk
+                    tracked_db_list.append([f"DS_{trk_id}", class_name, round(conf, 3), "DeepSORT"])
+                
+                # Sort and slice
+                try:
+                    tracked_db_list = sorted(tracked_db_list, key=lambda x: (x[3], x[0]))
+                except:
+                    pass
+                self.stats["tracked_objects"] = tracked_db_list[:10]
+
+            # Yield thread execution time (~30 FPS target loop delay)
+            time.sleep(0.03)
+
     def _draw_overlay(self, frame, tracks, theme_color):
         """
-        Draws dynamic retail style bounding boxes, text badges, and physical 
-        top-edge confidence progress lines on the raw frame.
+        Draws dynamic retail style bounding boxes, text badges, and linear top progress lines on frame.
         """
         for trk in tracks:
             x1, y1, x2, y2, track_id, class_name, conf = trk
             cx1, cy1, cx2, cy2 = int(x1), int(y1), int(x2), int(y2)
             
-            # Bright saturated colors generated deterministically from ID
             box_color = config.get_id_color_bgr(track_id)
-            
-            # A) Draw bounding box
             cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), box_color, 2)
             
-            # B) Monospace Badge on top-left of box
             badge_text = f"{class_name.upper()} #{track_id}"
             (tw, th), baseline = cv2.getTextSize(badge_text, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
-            
-            # Solid color background badge matching ID color
             cv2.rectangle(frame, (cx1, cy1 - th - 8), (cx1 + tw + 10, cy1), box_color, -1)
+            cv2.putText(frame, badge_text, (cx1 + 5, cy1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 1, cv2.LINE_AA)
             
-            # Black high-contrast text overlay in badge
-            cv2.putText(
-                frame, badge_text, (cx1 + 5, cy1 - 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 1, cv2.LINE_AA
-            )
-            
-            # C) Thin top-edge confidence progress bar directly on the frame!
-            # Red background bar
+            # Linear confidence progress bar on the top edge of box
             cv2.line(frame, (cx1, cy1), (cx2, cy1), (0, 0, 180), 2)
-            # Green foreground bar (scaling width based on confidence)
             width = cx2 - cx1
             cv2.line(frame, (cx1, cy1), (cx1 + int(width * conf), cy1), theme_color, 2)
 
-    # -------------------------------------------------------------------------
-    # CORE CLEAN TERMINATION HOOK
-    # -------------------------------------------------------------------------
-    def on_close(self):
-        """
-        Proper release of camera handles and closing Tkinter session.
-        """
-        self.stop_tracking()
-        self.root.destroy()
-        sys.exit(0)
+    def _add_log(self, msg):
+        timestamp = time.strftime("%H:%M:%S")
+        self.event_logs.append(f"[{timestamp}] {msg}")
 
-# -------------------------------------------------------------------------
-# DIRECT SCRIPT RUN BOOTSTRAP
-# -------------------------------------------------------------------------
-if __name__ == "__main__":
-    app = MainController()
-    app.run()
+    # -------------------------------------------------------------------------
+    # STREAM MULTIPART WRAPPER
+    # -------------------------------------------------------------------------
+    def _stream_frame(self, tracker_name):
+        """
+        Generates JPEG streaming frames in standard boundary protocol.
+        """
+        while True:
+            frame = None
+            with self.lock:
+                if tracker_name == "sort":
+                    frame = self.latest_sort_frame
+                else:
+                    frame = self.latest_ds_frame
+                    
+            if frame is not None:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            time.sleep(0.04)  # Limit stream feed refresh speed
+
+    # -------------------------------------------------------------------------
+    # SERVER RUN BOOTSTRAP
+    # -------------------------------------------------------------------------
+    def run(self):
+        """
+        Launches the Flask web server on port 5000.
+        """
+        # Disable CLI logging output from Flask to keep terminal tidy
+        import logging
+        log = logging.getLogger('werkzeug')
+        log.setLevel(logging.ERROR)
+        
+        print("\n" + "="*80)
+        print(" [ONLINE] OBJECT DETECTION AND TRACKING WEB SERVER ACTIVATED")
+        print("          EXPOSING PIPELINE LIVE AT: http://localhost:5000")
+        print("="*80 + "\n")
+        
+        self.app.run(host="0.0.0.0", port=5000, threaded=True, debug=False)
+
+    # -------------------------------------------------------------------------
+    # HTML IN-MEMORY RENDERER
+    # -------------------------------------------------------------------------
+    def _get_html_page(self):
+        """
+        Returns the entire dark monospace HTML, CSS, and dynamic JS package in a single string.
+        """
+        return """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>OBJECT DETECTION & TRACKING SYSTEM - Live Web Portal</title>
+    <style>
+        /* Strict Dark Monospace Style Guidelines */
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Consolas', 'Courier New', monospace;
+        }
+        body {
+            background-color: #0a0a0a;
+            color: #ffffff;
+            overflow-x: hidden;
+        }
+        
+        /* SCREEN 1: SPLASH SCREEN Layout */
+        #splash-screen {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background-color: #0a0a0a;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+        }
+        .splash-title {
+            font-size: 24px;
+            font-weight: bold;
+            color: #00ff88;
+            margin-bottom: 5px;
+            text-align: center;
+        }
+        .splash-subtitle {
+            font-size: 13px;
+            color: #00cfff;
+            margin-bottom: 45px;
+            text-align: center;
+        }
+        .cards-container {
+            display: flex;
+            gap: 40px;
+            margin-bottom: 45px;
+        }
+        .info-card {
+            background-color: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            width: 280px;
+            height: 140px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+        }
+        .card-header-sort {
+            color: #00ff88;
+            font-weight: bold;
+            font-size: 14px;
+            margin-bottom: 10px;
+        }
+        .card-header-ds {
+            color: #00cfff;
+            font-weight: bold;
+            font-size: 14px;
+            margin-bottom: 10px;
+        }
+        .card-desc {
+            font-size: 11px;
+            color: #ffffff;
+            line-height: 1.5;
+        }
+        .btn-start {
+            background-color: #00ff88;
+            color: #000000;
+            border: none;
+            padding: 10px 25px;
+            font-size: 13px;
+            font-weight: bold;
+            cursor: pointer;
+            margin-right: 30px;
+        }
+        .btn-start:hover {
+            background-color: #00cfff;
+        }
+        .btn-quit-outline {
+            background-color: transparent;
+            color: #ff4444;
+            border: 1px solid #ff4444;
+            padding: 10px 25px;
+            font-size: 13px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .btn-quit-outline:hover {
+            background-color: #ff4444;
+            color: #ffffff;
+        }
+        .splash-credit {
+            position: absolute;
+            bottom: 20px;
+            font-size: 10px;
+            color: #888888;
+        }
+
+        /* SCREEN 2: LIVE DASHBOARD Layout */
+        #dashboard-screen {
+            display: none;
+            width: 100vw;
+            height: 100vh;
+            grid-template-rows: 1fr 50px;
+        }
+        .main-container {
+            display: grid;
+            grid-template-columns: 30% 30% 40%;
+            padding: 10px;
+            gap: 15px;
+            height: calc(100vh - 50px);
+            overflow: hidden;
+        }
+        .panel {
+            background-color: #111111;
+            border: 1px solid #2a2a2a;
+            display: flex;
+            flex-direction: column;
+            padding: 15px;
+            overflow: hidden;
+        }
+        .panel-title-sort {
+            color: #00ff88;
+            font-size: 14px;
+            font-weight: bold;
+            text-align: center;
+            margin-bottom: 15px;
+        }
+        .panel-title-ds {
+            color: #00cfff;
+            font-size: 14px;
+            font-weight: bold;
+            text-align: center;
+            margin-bottom: 15px;
+        }
+        .panel-title-stats {
+            color: #ffffff;
+            font-size: 14px;
+            font-weight: bold;
+            text-align: center;
+            margin-bottom: 15px;
+        }
+        .stream-view {
+            width: 100%;
+            aspect-ratio: 16/9;
+            background-color: #050505;
+            border: 1px solid #2a2a2a;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            overflow: hidden;
+            margin-bottom: 20px;
+        }
+        .stream-view img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        .counter-lbl {
+            font-size: 12px;
+            margin-bottom: 8px;
+        }
+        .lbl-green { color: #00ff88; }
+        .lbl-cyan { color: #00cfff; }
+        .lbl-muted { color: #888888; }
+
+        /* Stats Blocks (Scrollable Panel 3) */
+        .stats-scroller {
+            flex: 1;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            padding-right: 5px;
+        }
+        /* Custom scrollbar */
+        .stats-scroller::-webkit-scrollbar {
+            width: 4px;
+        }
+        .stats-scroller::-webkit-scrollbar-thumb {
+            background-color: #2a2a2a;
+        }
+        
+        .stats-card {
+            background-color: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            padding: 8px 12px;
+        }
+        .card-section-title {
+            font-size: 11px;
+            color: #888888;
+            margin-bottom: 6px;
+        }
+        .stats-line {
+            font-size: 12px;
+            margin-bottom: 4px;
+            display: flex;
+            justify-content: space-between;
+        }
+        .stats-line:last-child {
+            margin-bottom: 0;
+        }
+        
+        /* Table database layout */
+        .tracked-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 11px;
+            margin-top: 5px;
+        }
+        .tracked-table th {
+            text-align: left;
+            color: #888888;
+            padding-bottom: 6px;
+            font-weight: normal;
+        }
+        .tracked-table td {
+            padding: 4px 0;
+        }
+        .td-sort { color: #00ff88; }
+        .td-ds { color: #00cfff; }
+
+        /* Event logs */
+        .log-terminal {
+            background-color: #0c0c0c;
+            color: #ffffff;
+            font-size: 11px;
+            padding: 6px;
+            height: 100px;
+            overflow-y: auto;
+            border: 1px solid #2a2a2a;
+            white-space: pre-line;
+        }
+
+        /* BOTTOM BAR */
+        .bottom-bar {
+            background-color: #111111;
+            border-top: 1px solid #2a2a2a;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0 15px;
+        }
+        .controls-group {
+            display: flex;
+            gap: 15px;
+        }
+        .btn-control {
+            background-color: #111111;
+            border: 1px solid #2a2a2a;
+            color: #ffffff;
+            font-size: 12px;
+            padding: 6px 15px;
+            cursor: pointer;
+        }
+        .btn-control:hover {
+            background-color: #2a2a2a;
+        }
+        .btn-pause {
+            color: #00ff88;
+            border-color: #00ff88;
+        }
+        .btn-pause:hover {
+            background-color: #00ff88;
+            color: #000000;
+        }
+        .btn-reset {
+            color: #00cfff;
+            border-color: #00cfff;
+        }
+        .btn-reset:hover {
+            background-color: #00cfff;
+            color: #000000;
+        }
+        .btn-return {
+            color: #ff4444;
+            border-color: #ff4444;
+        }
+        .btn-return:hover {
+            background-color: #ff4444;
+            color: #ffffff;
+        }
+        .status-badge {
+            font-size: 12px;
+            color: #00ff88;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- SCREEN 1: SPLASH SCREEN -->
+    <div id="splash-screen">
+        <h1 class="splash-title">OBJECT DETECTION & TRACKING SYSTEM</h1>
+        <h3 class="splash-subtitle">Powered by YOLOv8 + SORT + DeepSORT</h3>
+        
+        <div class="cards-container">
+            <div class="info-card">
+                <div class="card-header-sort">SORT TRACKER</div>
+                <div class="card-desc">Kalman Filter +<br>Intersection over Union (IoU)<br>Real-time Fast Association</div>
+            </div>
+            <div class="info-card">
+                <div class="card-header-ds">DeepSORT TRACKER</div>
+                <div class="card-desc">Kalman Filter +<br>Deep Appearance Re-ID<br>Robust Against Occlusions</div>
+            </div>
+        </div>
+        
+        <div>
+            <button class="btn-start" onclick="startTracking()">START SYSTEM</button>
+            <button class="btn-quit-outline" onclick="quitSystem()">QUIT</button>
+        </div>
+        
+        <div class="splash-credit">Enterprise Vision System v1.0 // Antigravity Core</div>
+    </div>
+
+    <!-- SCREEN 2: LIVE DASHBOARD -->
+    <div id="dashboard-screen">
+        <div class="main-container">
+            
+            <!-- COLUMN 1: SORT -->
+            <div class="panel">
+                <h2 class="panel-title-sort">SORT TRACKER FEED</h2>
+                <div class="stream-view" id="sort-stream-container">
+                    <!-- Stream image injected on start -->
+                    <div style="color: #888888; font-size:11px;">Awaiting start...</div>
+                </div>
+                <div>
+                    <div class="counter-lbl lbl-green" id="sort-active-lbl">ACTIVE TRACKS: 0 units</div>
+                    <div class="counter-lbl lbl-muted" id="sort-lost-lbl">LOST TRACKS:   0 units</div>
+                </div>
+            </div>
+            
+            <!-- COLUMN 2: DeepSORT -->
+            <div class="panel">
+                <h2 class="panel-title-ds">DeepSORT TRACKER FEED</h2>
+                <div class="stream-view" id="ds-stream-container">
+                    <!-- Stream image injected on start -->
+                    <div style="color: #888888; font-size:11px;">Awaiting start...</div>
+                </div>
+                <div>
+                    <div class="counter-lbl lbl-cyan" id="ds-active-lbl">ACTIVE TRACKS: 0 units</div>
+                    <div class="counter-lbl lbl-muted" id="ds-lost-lbl">LOST TRACKS:   0 units</div>
+                </div>
+            </div>
+            
+            <!-- COLUMN 3: STATS & RETAIL -->
+            <div class="panel">
+                <h2 class="panel-title-stats">REAL-TIME DIAGNOSTICS & ANALYTICS</h2>
+                
+                <div class="stats-scroller">
+                    <!-- Speed FPS card -->
+                    <div class="stats-card">
+                        <div class="stats-line lbl-green" id="fps-sort-lbl">SORT SPEED:     0.0 FPS</div>
+                        <div class="stats-line lbl-cyan" id="fps-ds-lbl">DeepSORT SPEED: 0.0 FPS</div>
+                        <div class="stats-line" id="dets-lbl" style="color:#ffffff;">YOLOv8 DETECTED: 0 objects</div>
+                    </div>
+                    
+                    <!-- ID Switches stability -->
+                    <div class="stats-card">
+                        <div class="card-section-title">TRACKING IDENTIFICATION FRAGMENTATION</div>
+                        <div class="stats-line lbl-green" id="switches-sort-lbl">SORT ID SWITCHES:     0 instances</div>
+                        <div class="stats-line lbl-cyan" id="switches-ds-lbl">DeepSORT ID SWITCHES: 0 instances</div>
+                    </div>
+                    
+                    <!-- Retail analytical card -->
+                    <div class="stats-card">
+                        <div class="card-section-title">RETAIL ANALYTICS SUMMARY</div>
+                        <div class="stats-line lbl-green" id="footfall-lbl" style="font-weight:bold;">TOTAL UNIQUE CUSTOMERS: 0 persons</div>
+                        <div style="font-size:11px; color:#ffffff; margin:6px 0 2px 0;">CUSTOMER DWELL DURATION (TOP 3 VISIBLE):</div>
+                        <div style="font-size:10px; color:#888888; padding-left:10px; line-height:1.4;" id="dwell-list">
+                            No shoppers currently visible in-frame.
+                        </div>
+                    </div>
+                    
+                    <!-- Tracked db database table -->
+                    <div class="stats-card" style="flex:1; min-height:160px; display:flex; flex-direction:column;">
+                        <div class="card-section-title">CURRENT ACTIVE REGISTRATION DATABASE</div>
+                        <table class="tracked-table">
+                            <thead>
+                                <tr>
+                                    <th style="width:15%;">ID</th>
+                                    <th style="width:25%;">LABEL</th>
+                                    <th style="width:45%;">CONFIDENCE BAR</th>
+                                    <th style="width:15%;">TRACKER</th>
+                                </tr>
+                            </thead>
+                            <tbody id="table-body">
+                                <!-- Dynamic rows (up to 10) -->
+                                <tr><td colspan="4" style="color:#888888; text-align:center; padding-top:20px;">Awaiting active tracks...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <!-- scrolling security event logs -->
+                    <div class="stats-card">
+                        <div class="card-section-title">SECURITY CONTROL SESSION EVENT LOG</div>
+                        <div class="log-terminal" id="log-box">
+                            [00:00:00] SYSTEM STANDBY: Awaiting operator start initialization...
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+        </div>
+        
+        <!-- BOTTOM BAR -->
+        <div class="bottom-bar">
+            <div class="controls-group">
+                <button class="btn-control btn-pause" id="btn-pause-lbl" onclick="togglePause()">PAUSE TRACKING</button>
+                <button class="btn-control btn-reset" onclick="resetStats()">RESET STATS</button>
+                <button class="btn-control btn-return" onclick="returnToMenu()">RETURN TO MENU</button>
+            </div>
+            <div class="status-badge" id="status-badge-lbl">RUNNING - BOTH TRACKERS ACTIVE</div>
+        </div>
+    </div>
+
+    <script>
+        let statsInterval = null;
+        let isPaused = false;
+        
+        function startTracking() {
+            // Tell backend to trigger yolo models and camera
+            fetch('/api/start')
+                .then(r => r.json())
+                .then(d => {
+                    // Hide Splash, show Dashboard
+                    document.getElementById('splash-screen').style.display = 'none';
+                    document.getElementById('dashboard-screen').style.display = 'grid';
+                    
+                    // Inject stream feeds
+                    document.getElementById('sort-stream-container').innerHTML = '<img src="/video_feed/sort" alt="SORT FEED">';
+                    document.getElementById('ds-stream-container').innerHTML = '<img src="/video_feed/deepsort" alt="DeepSORT FEED">';
+                    
+                    // Reset pause states
+                    isPaused = false;
+                    document.getElementById('btn-pause-lbl').innerText = 'PAUSE TRACKING';
+                    
+                    // Poll stats every 100ms
+                    if (statsInterval) clearInterval(statsInterval);
+                    statsInterval = setInterval(fetchStats, 100);
+                });
+        }
+        
+        function fetchStats() {
+            fetch('/api/stats')
+                .then(r => r.json())
+                .then(data => {
+                    const stats = data.stats;
+                    const logs = data.logs;
+                    
+                    // Update labels
+                    document.getElementById('sort-active-lbl').innerText = 'ACTIVE TRACKS: ' + stats.sort_active + ' units';
+                    document.getElementById('sort-lost-lbl').innerText = 'LOST TRACKS:   ' + stats.sort_lost + ' units';
+                    
+                    document.getElementById('ds-active-lbl').innerText = 'ACTIVE TRACKS: ' + stats.ds_active + ' units';
+                    document.getElementById('ds-lost-lbl').innerText = 'LOST TRACKS:   ' + stats.ds_lost + ' units';
+                    
+                    document.getElementById('fps_sort-lbl').innerText = 'SORT SPEED:     ' + stats.fps_sort + ' FPS';
+                    document.getElementById('fps_ds-lbl').innerText = 'DeepSORT SPEED: ' + stats.fps_ds + ' FPS';
+                    document.getElementById('dets-lbl').innerText = 'YOLOv8 DETECTED: ' + stats.dets_count + ' objects';
+                    
+                    document.getElementById('switches_sort-lbl').innerText = 'SORT ID SWITCHES:     ' + stats.switches_sort + ' instances';
+                    document.getElementById('switches_ds-lbl').innerText = 'DeepSORT ID SWITCHES: ' + stats.switches_ds + ' instances';
+                    
+                    document.getElementById('footfall-lbl').innerText = 'TOTAL UNIQUE CUSTOMERS: ' + stats.footfall + ' persons';
+                    document.getElementById('dwell-list').innerHTML = stats.dwell_list;
+                    
+                    document.getElementById('status-badge-lbl').innerText = stats.status_text;
+                    if (stats.status_text.includes("PAUSED")) {
+                        document.getElementById('status-badge-lbl').style.color = '#ff4444';
+                    } else if (stats.status_text.includes("SIMULATION")) {
+                        document.getElementById('status-badge-lbl').style.color = '#00cfff';
+                    } else {
+                        document.getElementById('status-badge-lbl').style.color = '#00ff88';
+                    }
+                    
+                    // Update Table database
+                    const tbody = document.getElementById('table-body');
+                    if (stats.tracked_objects.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="4" style="color:#888888; text-align:center; padding-top:20px;">No active targets registered.</td></tr>';
+                    } else {
+                        let html = '';
+                        stats.tracked_objects.forEach(obj => {
+                            const objId = obj[0];
+                            const label = obj[1];
+                            const conf = obj[2];
+                            const tracker = obj[3];
+                            
+                            // Text bar [██████░░░░] 60%
+                            const numBlocks = Math.round(conf * 10);
+                            const blocks = '█'.repeat(numBlocks) + '░'.repeat(10 - numBlocks);
+                            const progressStr = '[' + blocks + '] ' + (conf * 100).toFixed(1) + '%';
+                            
+                            const cls = tracker === 'SORT' ? 'td-sort' : 'td-ds';
+                            
+                            html += `<tr>
+                                <td class="${cls}">${objId}</td>
+                                <td>${label}</td>
+                                <td>${progressStr}</td>
+                                <td class="${cls}">${tracker}</td>
+                            </tr>`;
+                        });
+                        tbody.innerHTML = html;
+                    }
+                    
+                    // Update scrolling terminal logs
+                    const logBox = document.getElementById('log-box');
+                    logBox.innerHTML = logs.join('\\n');
+                    logBox.scrollTop = logBox.scrollHeight;
+                });
+        }
+        
+        function togglePause() {
+            fetch('/api/pause', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    isPaused = data.paused;
+                    document.getElementById('btn-pause-lbl').innerText = isPaused ? 'RESUME TRACKING' : 'PAUSE TRACKING';
+                });
+        }
+        
+        function resetStats() {
+            if (confirm("Confirm reset of all analytical records and tracking databases?")) {
+                fetch('/api/reset', { method: 'POST' });
+            }
+        }
+        
+        function returnToMenu() {
+            // Stop stats loop
+            if (statsInterval) clearInterval(statsInterval);
+            
+            // Go to splash, stop feeds
+            document.getElementById('sort-stream-container').innerHTML = '<div style="color: #888888; font-size:11px;">Awaiting start...</div>';
+            document.getElementById('ds-stream-container').innerHTML = '<div style="color: #888888; font-size:11px;">Awaiting start...</div>';
+            
+            document.getElementById('splash-screen').style.display = 'flex';
+            document.getElementById('dashboard-screen').style.display = 'none';
+        }
+        
+        function quitSystem() {
+            if (confirm("Confirm complete shutdown and termination of visual server processes?")) {
+                fetch('/api/quit', { method: 'POST' })
+                    .then(() => {
+                        alert("Visual systems server closed cleanly. You may close this tab.");
+                        window.close();
+                    });
+            }
+        }
+    </script>
+</body>
+</html>"""
