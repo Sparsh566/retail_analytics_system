@@ -174,11 +174,11 @@ class MainController:
                 self.sort_tracker.dead_track_history.clear()
                 
             if self.deepsort_tracker:
-                self.deepsort_tracker.id_switches = 0
-                self.deepsort_tracker.dead_track_history.clear()
                 if not self.deepsort_tracker.is_emulated:
-                    self.deepsort_tracker.tracker.tracks.clear()
+                    self.deepsort_tracker = DeepSortTracker(max_age=15, n_init=3)
                 else:
+                    self.deepsort_tracker.id_switches = 0
+                    self.deepsort_tracker.dead_track_history.clear()
                     self.deepsort_tracker.emulated_tracker.id_switches = 0
                     self.deepsort_tracker.emulated_tracker.trackers.clear()
                     self.deepsort_tracker.emulated_tracker.dead_track_history.clear()
