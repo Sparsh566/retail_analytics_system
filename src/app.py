@@ -38,10 +38,10 @@ class MainController:
         self.sort_queue = queue.Queue(maxsize=1)
         self.deepsort_queue = queue.Queue(maxsize=1)
         
-        # Subsystems
-        self.detector = None
-        self.sort_tracker = None
-        self.deepsort_tracker = None
+        # Subsystems (Eagerly instantiated in the main thread to prevent PyTorch thread deadlocks)
+        self.detector = Detector()
+        self.sort_tracker = SortTracker(max_age=15, min_hits=3, iou_threshold=0.25)
+        self.deepsort_tracker = DeepSortTracker(max_age=15, n_init=3)
         
         # JPEG streaming frame buffers
         self.latest_sort_frame = None
@@ -93,12 +93,15 @@ class MainController:
             
         @self.app.route("/api/start")
         def api_start():
+            print(f"[DEBUG] /api/start endpoint hit. Current loop_active: {self.loop_active}", flush=True)
             if not self.loop_active:
                 self.start_tracking()
+            print(f"[DEBUG] /api/start completed. New loop_active: {self.loop_active}", flush=True)
             return jsonify({"status": "started"})
             
         @self.app.route("/api/stats")
         def api_stats():
+            print(f"[DEBUG] /api/stats endpoint hit. loop_active: {self.loop_active}, logs: {len(self.event_logs)}", flush=True)
             with self.lock:
                 return jsonify({
                     "stats": self.stats,
@@ -137,10 +140,13 @@ class MainController:
         """
         Loads models, creates queues, and spawns the three concurrent pipeline threads.
         """
-        # Init components
-        self.detector = Detector()
-        self.sort_tracker = SortTracker(max_age=15, min_hits=3, iou_threshold=0.25)
-        self.deepsort_tracker = DeepSortTracker(max_age=15, n_init=3)
+        # Reuse already eagerly initialized subsystems if present
+        if self.detector is None:
+            self.detector = Detector()
+        if self.sort_tracker is None:
+            self.sort_tracker = SortTracker(max_age=15, min_hits=3, iou_threshold=0.25)
+        if self.deepsort_tracker is None:
+            self.deepsort_tracker = DeepSortTracker(max_age=15, n_init=3)
         
         self.reset_system_stats()
         self._add_log("SYSTEM ACTION: Activating concurrent sensors and tracking threads...")
@@ -158,7 +164,7 @@ class MainController:
         self.det_thread.start()
         self.sort_thread.start()
         self.ds_thread.start()
-        print("[INFO] Decoupled Queue-Based Parallel Threads initialized successfully.")
+        print("[INFO] Decoupled Queue-Based Parallel Threads initialized successfully.", flush=True)
 
     def stop_tracking(self):
         """
@@ -898,12 +904,12 @@ class MainController:
                     document.getElementById('ds-active-lbl').innerText = 'ACTIVE TRACKS: ' + stats.ds_active + ' units';
                     document.getElementById('ds-lost-lbl').innerText = 'LOST TRACKS:   ' + stats.ds_lost + ' units';
                     
-                    document.getElementById('fps_sort-lbl').innerText = 'SORT SPEED:     ' + stats.fps_sort + ' FPS';
-                    document.getElementById('fps_ds-lbl').innerText = 'DeepSORT SPEED: ' + stats.fps_ds + ' FPS';
+                    document.getElementById('fps-sort-lbl').innerText = 'SORT SPEED:     ' + stats.fps_sort + ' FPS';
+                    document.getElementById('fps-ds-lbl').innerText = 'DeepSORT SPEED: ' + stats.fps_ds + ' FPS';
                     document.getElementById('dets-lbl').innerText = 'YOLOv8 DETECTED: ' + stats.dets_count + ' objects';
                     
-                    document.getElementById('switches_sort-lbl').innerText = 'SORT ID SWITCHES:     ' + stats.switches_sort + ' instances';
-                    document.getElementById('switches_ds-lbl').innerText = 'DeepSORT ID SWITCHES: ' + stats.switches_ds + ' instances';
+                    document.getElementById('switches-sort-lbl').innerText = 'SORT ID SWITCHES:     ' + stats.switches_sort + ' instances';
+                    document.getElementById('switches-ds-lbl').innerText = 'DeepSORT ID SWITCHES: ' + stats.switches_ds + ' instances';
                     
                     document.getElementById('footfall-lbl').innerText = 'TOTAL UNIQUE CUSTOMERS: ' + stats.footfall + ' persons';
                     document.getElementById('dwell-list').innerHTML = stats.dwell_list;

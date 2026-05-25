@@ -59,7 +59,7 @@ echo.
 :: 5. Boot Application
 echo [INFO] Launching vision dashboard window...
 echo.
-python main.py
+python -u main.py
 if %errorlevel% neq 0 (
     echo.
     echo [WARN] Application terminated with exit code %errorlevel%.
