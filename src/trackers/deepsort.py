@@ -91,7 +91,7 @@ class DeepSortTracker:
             # Get bounding box in tlbr [x1, y1, x2, y2]
             tlbr = trk.to_tlbr()
             track_id = trk.track_id
-            class_name = trk.get_class()
+            class_name = trk.det_class
             confidence = trk.get_det_conf() if trk.get_det_conf() is not None else 1.0
             
             # Filter clean integer outputs
@@ -115,14 +115,14 @@ class DeepSortTracker:
         # 4. Detect track terminations and append to dead history
         # We find which tracks were confirmed but are now dead or lost
         # Let's inspect tracker active tracks internally
-        for trk in self.tracker.tracks:
+        for trk in self.tracker.tracker.tracks:
             if trk.time_since_update == self.max_age:
                 tlbr = trk.to_tlbr()
                 dead_center = ((tlbr[0] + tlbr[2]) / 2, (tlbr[1] + tlbr[3]) / 2)
-                self.dead_track_history.append((dead_center, trk.get_class(), self.frame_count))
+                self.dead_track_history.append((dead_center, trk.det_class, self.frame_count))
 
         # Expose active and lost tracking counts for the dashboard
-        self.active_count = sum(1 for t in self.tracker.tracks if t.is_confirmed() and t.time_since_update == 0)
-        self.lost_count = sum(1 for t in self.tracker.tracks if t.is_confirmed() and t.time_since_update > 0)
+        self.active_count = sum(1 for t in self.tracker.tracker.tracks if t.is_confirmed() and t.time_since_update == 0)
+        self.lost_count = sum(1 for t in self.tracker.tracker.tracks if t.is_confirmed() and t.time_since_update > 0)
 
         return active_tracks
